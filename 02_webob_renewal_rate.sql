@@ -45,6 +45,7 @@ with first_pay_raw as (
     and e.date >= '${s_date}'
     and e.date <= '${e_date}'
     and e.product_id_all_product like '%webob%'
+    and e.product_is_subscribe = 1
     and e.all_product_order_type in ('新增', '续订')
     and (
       e.purchase_entrance_all_product is null
@@ -140,6 +141,7 @@ repay as (
     and e.date > '${s_date}'
     and e.date <= date_add('${e_date}', 190)
     and e.product_id_all_product like '%webob%'
+    and e.product_is_subscribe = 1
     and e.all_product_order_type = '续订'
     and (
       e.purchase_entrance_all_product is null
