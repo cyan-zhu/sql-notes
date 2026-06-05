@@ -6,9 +6,13 @@
 --
 -- 口径：
 -- 1. 只统计 product_id_all_product like '%webob%'
--- 2. 新增/续订用 all_product_order_type 区分
+-- 2. all_product_order_type = '新增' 为首续，'续订' 为非首续
 -- 3. 同用户、同 event、同 product_id_all_product 才算续订
--- 4. first_pay_step1 模拟神策漏斗：同一用户同一分组只保留最早步骤 1
+-- 4. 新增和续订均保留全部基数订单，不限制同一用户同月只取最早一笔
+-- 5. 7 天 SKU 的首续窗口为 35 天，非首续按续订周期计算
+-- 6. 续订率按用户计算：同月同分组多笔基数订单中任一笔续订成功，该用户即成功
+-- 7. 全局排除支付入口 75、10042、30033、100040、50024，适用于基数新增、基数续订和窗口期续订
+-- 8. 月份归属和扫描范围使用 date，步骤先后和窗口期使用精确事件时间 time
 
 with first_pay_raw as (
   select distinct
@@ -21,6 +25,7 @@ with first_pay_raw as (
       when '拉伸' then '拉伸'
     end as event_cn,
     e.date,
+    e.time,
     e.user_id as first_user_id,
     e.product_id_all_product,
     e.all_product_order_type as order_type,
@@ -63,12 +68,12 @@ first_pay as (
     order_type,
     product_type_group,
     coalesce(first_origin_money, 0) as first_origin_money,
-    date as first_date,
+    time as first_time,
     case
       when first_price = 0 and first_days = 7 and renew_days in (28, 30) then '0元7天-月'
       when first_price = 0 and first_days = 7 and renew_days in (84, 90) then '0元7天-季度'
       when first_price = 0 and first_days in (28, 30) and renew_days in (28, 30) then '0元-月'
-      when first_days = 7 and renew_days in (28, 30) then '7天-月'
+      when first_price > 0 and first_days = 7 and renew_days in (28, 30) then '7天-月'
       when first_days = 14 and renew_days = 14 then '半月'
       when first_days in (28, 30) and renew_days in (28, 30) then '月'
       when first_days in (84, 90) and renew_days in (84, 90) then '季度'
@@ -86,7 +91,7 @@ first_pay_with_window as (
   select
     *,
     case
-      when window_days_raw = 7 then 9
+      when order_type = '新增' and window_days_raw = 7 then 35
       when window_days_raw = 14 then 17
       when window_days_raw in (28, 30) then 35
       when window_days_raw in (84, 90) then 99
@@ -97,18 +102,9 @@ first_pay_with_window as (
     and window_days_raw is not null
 ),
 
-first_pay_step1 as (
+base_pay as (
   select *
-  from (
-    select
-      f.*,
-      row_number() over (
-        partition by event_cn, first_month, product_type_group, product_period_type, order_type, first_user_id
-        order by first_date asc, product_id_all_product asc
-      ) as rn
-    from first_pay_with_window f
-  ) t
-  where rn = 1
+  from first_pay_with_window
 ),
 
 first_keys as (
@@ -116,7 +112,7 @@ first_keys as (
     event,
     first_user_id as user_id,
     product_id_all_product
-  from first_pay_step1
+  from base_pay
 ),
 
 repay as (
@@ -124,7 +120,7 @@ repay as (
     e.event,
     e.user_id,
     e.product_id_all_product,
-    e.date as repay_date
+    e.time as repay_time
   from events e
   join first_keys k
     on e.event = k.event
@@ -158,13 +154,13 @@ first_with_repay as (
     f.order_type,
     f.first_user_id,
     max(case when r.user_id is not null then 1 else 0 end) as has_repay
-  from first_pay_step1 f
+  from base_pay f
   left join repay r
     on f.event = r.event
    and f.first_user_id = r.user_id
    and f.product_id_all_product = r.product_id_all_product
-   and r.repay_date > f.first_date
-   and r.repay_date <= date_add(f.first_date, f.diff_days)
+   and r.repay_time > f.first_time
+   and r.repay_time <= date_add(f.first_time, f.diff_days)
   group by
     f.event_cn,
     f.first_month,
@@ -195,7 +191,7 @@ revenue_agg as (
     product_period_type,
     order_type,
     cast(round(sum(first_origin_money), 0) as bigint) as revenue_base
-  from first_pay_step1
+  from base_pay
   group by event_cn, first_month, product_type_group, product_period_type, order_type
 ),
 
@@ -206,7 +202,7 @@ metric_long as (
     first_month as `续订基数发生月份`,
     product_type_group as `产品类型`,
     product_period_type,
-    order_type,
+    case when order_type = '新增' then '首续' else '非首续' end as `是否首续`,
     case when base_users > 0 then round(repay_users * 1.0 / base_users, 4) end as metric_value
   from user_agg
 
@@ -218,32 +214,30 @@ metric_long as (
     first_month as `续订基数发生月份`,
     product_type_group as `产品类型`,
     product_period_type,
-    order_type,
+    case when order_type = '新增' then '首续' else '非首续' end as `是否首续`,
     revenue_base as metric_value
   from revenue_agg
 )
 
 select
   `指标类型`,
-  `项目`,
   `续订基数发生月份`,
-  `产品类型`,
-  max(case when product_period_type = '7天-月' and order_type = '新增' then metric_value end) as `7天-月_新增`,
-  max(case when product_period_type = '7天-月' and order_type = '续订' then metric_value end) as `7天-月_续订`,
-  max(case when product_period_type = '0元7天-月' and order_type = '新增' then metric_value end) as `0元7天-月_新增`,
-  max(case when product_period_type = '0元7天-月' and order_type = '续订' then metric_value end) as `0元7天-月_续订`,
-  max(case when product_period_type = '0元7天-季度' and order_type = '新增' then metric_value end) as `0元7天-季度_新增`,
-  max(case when product_period_type = '0元7天-季度' and order_type = '续订' then metric_value end) as `0元7天-季度_续订`,
-  max(case when product_period_type = '0元-月' and order_type = '新增' then metric_value end) as `0元-月_新增`,
-  max(case when product_period_type = '0元-月' and order_type = '续订' then metric_value end) as `0元-月_续订`,
-  max(case when product_period_type = '半月' and order_type = '新增' then metric_value end) as `半月_新增`,
-  max(case when product_period_type = '半月' and order_type = '续订' then metric_value end) as `半月_续订`,
-  max(case when product_period_type = '月' and order_type = '新增' then metric_value end) as `月_新增`,
-  max(case when product_period_type = '月' and order_type = '续订' then metric_value end) as `月_续订`,
-  max(case when product_period_type = '季度' and order_type = '新增' then metric_value end) as `季度_新增`,
-  max(case when product_period_type = '季度' and order_type = '续订' then metric_value end) as `季度_续订`,
-  max(case when product_period_type = '半年' and order_type = '新增' then metric_value end) as `半年_新增`,
-  max(case when product_period_type = '半年' and order_type = '续订' then metric_value end) as `半年_续订`
+  `是否首续`,
+  max(case when `产品类型` = '会员' and product_period_type = '7天-月' then metric_value end) as `【会员】7天_月（首付非0）`,
+  max(case when `产品类型` = '会员' and product_period_type = '月' then metric_value end) as `【会员】月`,
+  max(case when `产品类型` = '会员' and product_period_type = '季度' then metric_value end) as `【会员】季`,
+  max(case when `产品类型` = '会员' and product_period_type = '半月' then metric_value end) as `【会员】半月（14d）`,
+  max(case when `产品类型` = '会员' and product_period_type = '半年' then metric_value end) as `【会员】半年（168d）`,
+  max(case when `产品类型` = '一级增值' and product_period_type = '0元-月' then metric_value end) as `【一级增值】首月0元`,
+  max(case when `产品类型` = '一级增值' and product_period_type = '月' then metric_value end) as `【一级增值】月`,
+  max(case when `产品类型` = '一级增值' and product_period_type = '季度' then metric_value end) as `【一级增值】季`,
+  max(case when `产品类型` = '一级增值' and product_period_type = '0元7天-月' then metric_value end) as `【一级增值】7天_月（首付0元）`,
+  max(case when `产品类型` = '一级增值' and product_period_type = '0元7天-季度' then metric_value end) as `【一级增值】7天_季（首付0元）`,
+  max(case when `产品类型` = '二级增值' and product_period_type = '月' then metric_value end) as `【二级增值】月`,
+  max(case when `产品类型` = '二级增值' and product_period_type = '季度' then metric_value end) as `【二级增值】季`
 from metric_long
-group by `指标类型`, `项目`, `续订基数发生月份`, `产品类型`
-order by `项目` asc, `续订基数发生月份` asc, `产品类型` asc;
+group by `指标类型`, `续订基数发生月份`, `是否首续`
+order by
+  case when `指标类型` = '续订率' then 1 else 2 end asc,
+  `续订基数发生月份` asc,
+  case when `是否首续` = '首续' then 1 else 2 end asc;
